@@ -339,17 +339,16 @@ class GatewayService(pb2_grpc.GatewayServicer):
             if not request.gateway_name or \
                request.gateway_name == self.gateway_name:
                 if not request.traddr:
-                    traddr = self.config.get("gateway", "addr")
-                    if not traddr:
+                    request.traddr = self.config.get("gateway", "addr")
+                    request.gateway_name = self.gateway_name
+                    if not request.traddr:
                         raise Exception("gateway.addr option is not set")
-                else:
-                    traddr = request.traddr
 
                 ret = self.spdk_rpc.nvmf.nvmf_subsystem_add_listener(
                     self.spdk_rpc_client,
                     nqn=request.nqn,
                     trtype=request.trtype,
-                    traddr=traddr,
+                    traddr=request.traddr,
                     trsvcid=request.trsvcid,
                     adrfam=request.adrfam,
                 )
@@ -395,17 +394,16 @@ class GatewayService(pb2_grpc.GatewayServicer):
             if not request.gateway_name or \
                request.gateway_name == self.gateway_name:
                 if not request.traddr:
-                    traddr = self.config.get("gateway", "addr")
-                    if not traddr:
+                    request.traddr = self.config.get("gateway", "addr")
+                    request.gateway_name = self.gateway_name
+                    if not request.traddr:
                         raise Exception("gateway.addr option is not set")
-                else:
-                    traddr = request.traddr
 
                 ret = self.spdk_rpc.nvmf.nvmf_subsystem_remove_listener(
                     self.spdk_rpc_client,
                     nqn=request.nqn,
                     trtype=request.trtype,
-                    traddr=traddr,
+                    traddr=request.traddr,
                     trsvcid=request.trsvcid,
                     adrfam=request.adrfam,
                 )
