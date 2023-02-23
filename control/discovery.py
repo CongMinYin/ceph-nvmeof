@@ -21,6 +21,15 @@ import socket
 import threading
 import time
 
+# 用于调用C/C++库
+import ctypes
+# 指定动态链接库
+lib = ctypes.cdll.LoadLibrary('./libdiscovery.so')
+#需要指定返回值的类型，默认是int
+lib.fab.restype = ctypes.c_int
+#lib.reverse.restype = ctypes.c_void_p
+#nvmf_lib = ctypes.cdll.LoadLibrary('/root/git/spdk/build/lib/libspdk_nvmf.so')
+
 class DiscoveryService:
     """Client for gRPC functionality with a gateway server.
 
@@ -54,6 +63,7 @@ class DiscoveryService:
 
         gateway_group = self.config.get("gateway", "group")
         self.omap_name = f"nvmeof.{gateway_group}.state" if gateway_group else "nvmeof.state"
+        self.logger.info(f"omap_name: {self.omap_name}")
 
         ceph_pool = self.config.get("ceph", "pool")
         ceph_conf = self.config.get("ceph", "config_file")
@@ -265,6 +275,14 @@ def main(args=None):
 
     # 建立TCP监听端口
     # discovery_service.start_service()
+
+    # 实践调C/C++库
+    logger.info("------------------")
+    logger.info("try call C++ lib")
+    c_ret = lib.fab(5)
+    logger.info(f"c_ret: {c_ret}")
+
+
 
 if __name__ == "__main__":
     main()
