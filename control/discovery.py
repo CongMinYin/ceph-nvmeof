@@ -655,13 +655,15 @@ class DiscoveryService:
         self.logger.debug("reply set feature request.")
         return 0
 
-    def reply_get_log_page(self, sock, data, cmd_id,
-                           self_gen_cnt, log_page, log_page_len):
+    def reply_get_log_page(self, sock, data, nvmeof_connect_data_hostnqn, cmd_id,
+                           self_gen_cnt, allow_listeners, log_page, log_page_len):
         """Reply get log page request."""
 
         self.logger.debug("handle get log page request.")
         my_omap_dict = self._read_all()
         listeners = self._get_vals(my_omap_dict, self.LISTENER_PREFIX)
+        hosts = self._get_vals(my_omap_dict, self.HOST_PREFIX)
+        hostnqn = (bytes(nvmeof_connect_data_hostnqn).decode('utf-8')).rstrip('\0')
 
         nvme_nsid = struct.unpack_from('<I', data, 12)[0]
         nvme_rsvd1 = struct.unpack_from('<Q', data, 16)[0]
@@ -686,31 +688,38 @@ class DiscoveryService:
 
         if get_logpage_lid != 0x70:
             self.logger.error(f"request type error, not discovery request.")
-            return -1, 0, 0
+            return -1, 0, 0, 0
 
         # Prepare all log page data segments
-        # TODO: Filter log entries based on access permissions
+        if len(allow_listeners) == 0:
+            for host in hosts:
+                a = host["host_nqn"]
+                if host["host_nqn"] == '*' or host["host_nqn"] == hostnqn:
+                    for listener in listeners:
+                        if host["subsystem_nqn"] == listener["subsystem_nqn"]:
+                            allow_listeners += (listener,)
+
         if log_page_len == 0 and nvme_data_len > 16:
-            log_page_len = 1024 * (len(listeners) + 1)
+            log_page_len = 1024 * (len(allow_listeners) + 1)
             log_page = bytearray(log_page_len)
 
             nvme_get_log_page_reply = NVMeGetLogPage()
             nvme_get_log_page_reply.genctr = struct.pack('<Q', self_gen_cnt)
-            nvme_get_log_page_reply.numrec = struct.pack('<Q', len(listeners))
+            nvme_get_log_page_reply.numrec = struct.pack('<Q', len(allow_listeners))
             log_page[0:1024] = nvme_get_log_page_reply.compose_data_reply()
 
             # log entries
             log_entry_counter = 0
-            while log_entry_counter < len(listeners):
+            while log_entry_counter < len(allow_listeners):
                 log_entry = DiscoveryLogEntry()
                 trtype = 0
                 adrfam = 0
-                if listeners[log_entry_counter]["trtype"] == "TCP":
+                if allow_listeners[log_entry_counter]["trtype"] == "TCP":
                     trtype = NVMF_TRTYPE_TCP
                 else:
                     # TODO
                     self.logger.debug(f"not implement other transport type")
-                if listeners[log_entry_counter]["adrfam"] == "ipv4":
+                if allow_listeners[log_entry_counter]["adrfam"] == "ipv4":
                     adrfam = NVMF_ADRFAM_IPV4
                 else:
                     # TODO
@@ -727,11 +736,11 @@ class DiscoveryService:
                 # admin max SQ size
                 log_entry.asqsz = b'\x80\x00'
                 # transport service indentifier
-                log_entry.trsvcid = str(listeners[log_entry_counter]["trsvcid"]).encode().ljust(32, b'\x20')
+                log_entry.trsvcid = str(allow_listeners[log_entry_counter]["trsvcid"]).encode().ljust(32, b'\x20')
                 # NVM subsystem qualified name
-                log_entry.subnqn = str(listeners[log_entry_counter]["nqn"]).encode().ljust(256, b'\x00')
+                log_entry.subnqn = str(allow_listeners[log_entry_counter]["subsystem_nqn"]).encode().ljust(256, b'\x00')
                 # Transport address
-                log_entry.traddr = str(listeners[log_entry_counter]["traddr"]).encode().ljust(256, b'\x20')
+                log_entry.traddr = str(allow_listeners[log_entry_counter]["traddr"]).encode().ljust(256, b'\x20')
 
                 log_page[1024*(log_entry_counter+1):1024*(log_entry_counter+2)] = log_entry.compose_reply()
                 log_entry_counter += 1
@@ -755,7 +764,7 @@ class DiscoveryService:
             # NVM Express
             nvme_get_log_page_reply = NVMeGetLogPage()
             nvme_get_log_page_reply.genctr = struct.pack('<Q', self_gen_cnt)
-            nvme_get_log_page_reply.numrec = struct.pack('<Q', len(listeners))
+            nvme_get_log_page_reply.numrec = struct.pack('<Q', len(allow_listeners))
 
             reply = pdu_reply.compose_reply() + nvme_tcp_data_pdu.compose_reply() + \
                     nvme_get_log_page_reply.compose_short_reply()
@@ -763,7 +772,7 @@ class DiscoveryService:
                 sock.sendall(reply)
             except BrokenPipeError:
                 self.logger.debug("client disconnected unexpectedly.")
-                return -1, 0, 0
+                return -1, 0, 0, 0
         elif nvme_data_len > 16 and nvme_data_len % 1024 == 0:
             # class Pdu and NVMeTcpDataPdu
             pdu_and_nvme_pdu_len = 8 + 16
@@ -789,12 +798,12 @@ class DiscoveryService:
                 sock.sendall(reply)
             except BrokenPipeError:
                 self.logger.debug("client disconnected unexpectedly.")
-                return -1, 0, 0
+                return -1, 0, 0, 0
         else:
             self.logger.error(f"lenghth error. It need be 16 or n*1024")
-            return -1, 0, 0
+            return -1, 0, 0, 0
         self.logger.debug("reply get log page request.")
-        return 0, log_page, log_page_len
+        return 0, allow_listeners, log_page, log_page_len
 
 
     def nvmeof_tcp_connection(self, sock, addr):
@@ -804,6 +813,7 @@ class DiscoveryService:
         nvmeof_connect_data_cntlid = 0
         nvmeof_connect_data_subnqn = ()
         nvmeof_connect_data_hostnqn = ()
+        allow_listeners = ()
         err = 0
         sq_head_ptr = 0
         log_page = bytearray()
@@ -886,8 +896,9 @@ class DiscoveryService:
                         self.logger.error("can't handle NVME_FCTYPE_DISCONNECT request.")
 
                 if opcode == NVME_AQ_OPC_GET_LOG_PAGE:
-                    err, log_page, log_page_len = self.reply_get_log_page(sock, data, cmd_id, self_gen_cnt,
-                                                                          log_page, log_page_len)
+                    err, allow_listeners, log_page, log_page_len = \
+                        self.reply_get_log_page(sock, data, nvmeof_connect_data_hostnqn, cmd_id,
+                                                self_gen_cnt, allow_listeners, log_page, log_page_len)
 
                 if opcode == NVME_AQ_OPC_IDENTIFY:
                     err, self.reply_identify(sock, data, cmd_id, self_cnlid,

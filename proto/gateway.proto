@@ -89,7 +89,7 @@ message remove_host_req {
 }
 
 message create_listener_req {
-	string nqn = 1;
+	string subsystem_nqn = 1;
 	string gateway_name = 2;
 	string trtype = 3;
 	string adrfam = 4;
@@ -98,7 +98,7 @@ message create_listener_req {
 }
 
 message delete_listener_req {
-	string nqn = 1;
+	string subsystem_nqn = 1;
 	string gateway_name = 2;
 	string trtype = 3;
 	string adrfam = 4;

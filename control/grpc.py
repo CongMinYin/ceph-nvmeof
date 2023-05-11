@@ -327,7 +327,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
 
         ret = True
         self.logger.info(f"Received request to create {request.gateway_name}"
-                         f" {request.trtype} listener for {request.nqn} at"
+                         f" {request.trtype} listener for {request.subsystem_nqn} at"
                          f" {request.traddr}:{request.trsvcid}.")
         try:
             if (request.gateway_name and not request.traddr) or \
@@ -346,7 +346,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
 
                 ret = self.spdk_rpc.nvmf.nvmf_subsystem_add_listener(
                     self.spdk_rpc_client,
-                    nqn=request.nqn,
+                    nqn=request.subsystem_nqn,
                     trtype=request.trtype,
                     traddr=traddr,
                     trsvcid=request.trsvcid,
@@ -365,7 +365,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
             try:
                 json_req = json_format.MessageToJson(
                     request, preserving_proto_field_name=True)
-                self.gateway_state.add_listener(request.nqn,
+                self.gateway_state.add_listener(request.subsystem_nqn,
                                                 request.gateway_name,
                                                 request.trtype, request.traddr,
                                                 request.trsvcid, json_req)
@@ -381,7 +381,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
 
         ret = True
         self.logger.info(f"Received request to delete {request.gateway_name}"
-                         f" {request.trtype} listener for {request.nqn} at"
+                         f" {request.trtype} listener for {request.subsystem_nqn} at"
                          f" {request.traddr}:{request.trsvcid}.")
         try:
             if (request.gateway_name and not request.traddr) or \
@@ -400,7 +400,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
 
                 ret = self.spdk_rpc.nvmf.nvmf_subsystem_remove_listener(
                     self.spdk_rpc_client,
-                    nqn=request.nqn,
+                    nqn=request.subsystem_nqn,
                     trtype=request.trtype,
                     traddr=traddr,
                     trsvcid=request.trsvcid,
@@ -417,7 +417,7 @@ class GatewayService(pb2_grpc.GatewayServicer):
         if context:
             # Update gateway state
             try:
-                self.gateway_state.remove_listener(request.nqn,
+                self.gateway_state.remove_listener(request.subsystem_nqn,
                                                    request.gateway_name,
                                                    request.trtype,
                                                    request.traddr,

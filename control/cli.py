@@ -281,7 +281,7 @@ class GatewayClient:
 
         try:
             req = pb2.create_listener_req(
-                nqn=args.subnqn,
+                subsystem_nqn=args.subnqn,
                 gateway_name=args.gateway_name,
                 trtype=args.trtype,
                 adrfam=args.adrfam,
@@ -306,7 +306,7 @@ class GatewayClient:
 
         try:
             req = pb2.delete_listener_req(
-                nqn=args.subnqn,
+                subsystem_nqn=args.subnqn,
                 gateway_name=args.gateway_name,
                 trtype=args.trtype,
                 adrfam=args.adrfam,
