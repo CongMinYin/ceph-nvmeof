@@ -16,10 +16,13 @@ from .config import GatewayConfig
 import rados
 from typing import Dict, Optional
 
+import time
+import selectors
 import socket
 import threading
-import time
 import struct
+
+from .state import GatewayState, LocalGatewayState, OmapGatewayState, GatewayStateHandler
 
 # NVMe tcp pdu type
 NVME_TCP_ICREQ = 0x0
@@ -98,6 +101,9 @@ NVMF_TREQ_SECURE_CHANNEL_NOT_SPECIFIED = 0x0
 NVMF_TREQ_SECURE_CHANNEL_REQUIRED = 0x1
 NVMF_TREQ_SECURE_CHANNEL_NOT_REQUIRED = 0x2
 
+# maximum number of connections
+MAX_CONNECTION = 10240
+
 # NVMe tcp package length, refer: MTU = 1500 bytes
 NVME_TCP_PDU_UNIT = 1024
 
@@ -111,6 +117,26 @@ GLOBAL_CNLID = 0x1
 
 # Global generation counter
 GLOBAL_GEN_CNT = 0x1
+
+class Connection:
+    def __init__(self):
+        self.connection = 0
+        self.nvmeof_connect_data_hostid = ()
+        self.nvmeof_connect_data_cntlid = 0
+        self.nvmeof_connect_data_subnqn = ()
+        self.nvmeof_connect_data_hostnqn = ()
+        self.sq_head_ptr = 0
+        self.log_page = bytearray()
+        self.log_page_len = 0
+        self.property_data = b''
+        self.shutdown_now = 0
+        self.cnlid = 0
+        self.gen_cnt = 0
+        self.recv_async = False
+        self.async_cmd_id = 0
+        self.keep_alive_time = 0
+        self.keep_alive_timeout = 15
+        self.recv_buffer = b''
 
 class Pdu:
     def __init__(self):
@@ -265,8 +291,8 @@ class NVMeIdentify:
                self.nvmeof_attributes + self.power_state_attributes + \
                self.vendor_specific
 
-
-class CqeSetFeature:
+# for set feature, keep alive and async
+class CqeNVMe:
     def __init__(self):
         # DWORD0
         self.dword0 = bytearray(4)
@@ -365,7 +391,7 @@ class DiscoveryService:
 
         gateway_group = self.config.get("gateway", "group")
         self.omap_name = f"nvmeof.{gateway_group}.state" if gateway_group else "nvmeof.state"
-        self.logger.info(f"omap_name: {self.omap_name}")
+        self.logger.debug(f"omap_name: {self.omap_name}")
 
         ceph_pool = self.config.get("ceph", "pool")
         ceph_conf = self.config.get("ceph", "config_file")
@@ -378,7 +404,10 @@ class DiscoveryService:
         if self.discovery_addr == '' or self.discovery_port == '':
             self.logger.error(f"discovery addr/port are empty.")
             assert 0
-        self.logger.info(f"discovery addr: {self.discovery_addr} port: {self.discovery_port}")
+        self.logger.debug(f"discovery addr: {self.discovery_addr} port: {self.discovery_port}")
+
+        self.conn_vals = {}
+        self.selector = selectors.DefaultSelector()
 
     def _read_all(self) -> Dict[str, str]:
         """Reads OMAP and returns dict of all keys and values."""
@@ -400,11 +429,10 @@ class DiscoveryService:
                 vals.append(js)
         return vals
 
-    def reply_initialize(self, sock):
+    def reply_initialize(self, conn):
         """Reply initialize request."""
 
         self.logger.debug("handle ICreq.")
-
         pdu_reply = Pdu()
         pdu_reply.type = bytearray([NVME_TCP_ICRESP])
         pdu_reply.header_length = b'\x80'
@@ -415,16 +443,15 @@ class DiscoveryService:
         icresp_reply.maximum_data_capsules = b'\x00\x00\x02\x00'
 
         reply = pdu_reply.compose_reply() + icresp_reply.compose_reply() + bytearray(112)
-
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
             self.logger.error("client disconnected unexpectedly.")
             return -1
         self.logger.debug("reply initialize connection request.")
         return 0
 
-    def reply_fc_cmd_connect(self, sock, data, self_cnlid, sq_head_ptr):
+    def reply_fc_cmd_connect(self, conn, data):
         """Reply connect request."""
 
         self.logger.debug("handle connect request.")
@@ -442,10 +469,18 @@ class DiscoveryService:
         connect_attributes = CMD2[3]
         keep_alive_timeout = CMD2[5]
 
-        nvmeof_connect_data_hostid = struct.unpack_from('<16B', data, 72)
-        nvmeof_connect_data_cntlid = struct.unpack_from('<H', data, 88)[0]
-        nvmeof_connect_data_subnqn = struct.unpack_from('<256B', data, 328)
-        nvmeof_connect_data_hostnqn = struct.unpack_from('<256B', data, 584)
+        self.conn_vals[conn.fileno()].keep_alive_time = time.time()
+        self.logger.debug(f"connection keep alive {keep_alive_timeout}ms.")
+        self.conn_vals[conn.fileno()].keep_alive_timeout = keep_alive_timeout / 1000
+
+        self.conn_vals[conn.fileno()].nvmeof_connect_data_hostid = \
+            struct.unpack_from('<16B', data, 72)
+        self.conn_vals[conn.fileno()].nvmeof_connect_data_cntlid = \
+            struct.unpack_from('<H', data, 88)[0]
+        self.conn_vals[conn.fileno()].nvmeof_connect_data_subnqn = \
+            struct.unpack_from('<256B', data, 328)
+        self.conn_vals[conn.fileno()].nvmeof_connect_data_hostnqn = \
+            struct.unpack_from('<256B', data, 584)
 
         pdu_reply = Pdu()
         pdu_reply.type = bytearray([NVME_TCP_RSP])
@@ -454,25 +489,24 @@ class DiscoveryService:
 
         # Cqe for cmd connect
         connect_reply = CqeConnect()
-        connect_reply.controller_id = struct.pack('<H', self_cnlid)
-        connect_reply.sq_head_ptr = struct.pack('<H', sq_head_ptr)
+        connect_reply.controller_id = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].cnlid)
+        connect_reply.sq_head_ptr = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].sq_head_ptr)
 
         reply = pdu_reply.compose_reply() + connect_reply.compose_reply()
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
-            self.logger.debug("client disconnected unexpectedly.")
-            return -1, 0, 0, 0, 0
+            self.logger.error("client disconnected unexpectedly.")
+            return -1
         self.logger.debug("reply connect request.")
-        return 0, nvmeof_connect_data_hostid, nvmeof_connect_data_cntlid, \
-               nvmeof_connect_data_subnqn, nvmeof_connect_data_hostnqn
+        return 0
 
-    def reply_fc_cmd_prop_get(self, sock, data, sq_head_ptr,
-                              cmd_id, shutdown_notification):
+    def reply_fc_cmd_prop_get(self, conn, data, cmd_id):
         """Reply property get request."""
 
         self.logger.debug("handle property get request.")
-        shutdown_now = 0
         nvmeof_prop_get_set_rsvd0 = struct.unpack_from('<35B', data, 13)
         # property size = (attrib+1)x4, 0x1 means 8 bytes
         nvmeof_prop_get_set_attrib = struct.unpack_from('<1B', data, 48)[0]
@@ -492,35 +526,42 @@ class DiscoveryService:
             # \x01 contiguous queues required: true
             # \x1e timeout(to ready status): 1e(15000 ms), \x01=500ms
             # \x20 Q: command sets supportd: 1 (NVM IO command set)?
+            # TODO: timeout keep consistent with keep_alive in connect requet?
             property_get.property_data = b'\x7f\x00\x01\x1e\x20\x00\x00\x00'
-        if nvmeof_prop_get_set_offset == NVME_CTL_CONFIGURATION:
-            # won't run here，configuration discovery belongs to property set
-            self.logger.error("do not support controller configuration in property get")
-            return -1, 0
-        if nvmeof_prop_get_set_offset == NVME_CTL_STATUS:
+        elif nvmeof_prop_get_set_offset == NVME_CTL_CONFIGURATION:
+            # b'\x00\x00\x46\x00\x00\x00\x00\x00'
+            # 0x46: IO Submission Queue Entry Size: 0x6 (64 bytes)
+            # IO Completion Queue Entry Size: 0x4 (16 bytes)
+            property_get.property_data = struct.pack('<Q', \
+                self.conn_vals[conn.fileno()].property_data[0])
+        elif nvmeof_prop_get_set_offset == NVME_CTL_STATUS:
+            shutdown_notification = \
+                (self.conn_vals[conn.fileno()].property_data[0] >> 14) & 0x3
             if shutdown_notification == 0:
                 # controller status: ready
                 property_get.property_data = b'\x01\x00\x00\x00\x00\x00\x00\x00'
             else:
                 # here shutdown_notification should be 0x1
                 property_get.property_data = b'\x09\x00\x00\x00\x00\x00\x00\x00'
-                shutdown_now = 1
-        if nvmeof_prop_get_set_offset == NVME_CTL_VERSION:
+                self.conn_vals[conn.fileno()].shutdown_now = 1
+        elif nvmeof_prop_get_set_offset == NVME_CTL_VERSION:
             # Q: nvme version: 1.3?
             property_get.property_data = b'\x00\x03\x01\x00\x00\x00\x00\x00'
-        property_get.sq_head_ptr = struct.pack('<H', sq_head_ptr)
+        else:
+            self.logger.error("not supported prop get type")
+        property_get.sq_head_ptr = struct.pack('<H', self.conn_vals[conn.fileno()].sq_head_ptr)
         property_get.cmd_id = struct.pack('<H', cmd_id)
 
         reply = pdu_reply.compose_reply() + property_get.compose_reply()
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
-            self.logger.debug("client disconnected unexpectedly.")
-            return -1, 0
+            self.logger.error("client disconnected unexpectedly.")
+            return -1
         self.logger.debug("reply property get request.")
-        return 0, shutdown_now
+        return 0
 
-    def reply_fc_cmd_prop_set(self, sock, data, sq_head_ptr, cmd_id):
+    def reply_fc_cmd_prop_set(self, conn, data, cmd_id):
         """Reply property set request."""
 
         self.logger.debug("handle property set request.")
@@ -528,8 +569,17 @@ class DiscoveryService:
         nvmeof_prop_get_set_attrib = struct.unpack_from('<1B', data, 48)[0]
         nvmeof_prop_get_set_rsvd1 = struct.unpack_from('<3B', data, 49)
         nvmeof_prop_get_set_offset = struct.unpack_from('<I', data, 52)[0]
-        controller_configuration = struct.unpack_from('<4B', data, 56)
-        shutdown_notification = (controller_configuration[1] >> 6) & 0x3
+        if nvmeof_prop_get_set_offset == NVME_CTL_CAPABILITIES:
+            self.logger.error("not supported prop set capabilities type.")
+        elif nvmeof_prop_get_set_offset == NVME_CTL_CONFIGURATION:
+            self.conn_vals[conn.fileno()].property_data = \
+                struct.unpack_from('<Q', data, 56)
+        elif nvmeof_prop_get_set_offset == NVME_CTL_STATUS:
+            self.logger.error("not supported prop set status type.")
+        elif nvmeof_prop_get_set_offset == NVME_CTL_VERSION:
+            self.logger.error("not supported prop set version type.")
+        else:
+            self.logger.error("not supported prop set type.")
 
         pdu_reply = Pdu()
         pdu_reply.type = bytearray([NVME_TCP_RSP])
@@ -539,23 +589,20 @@ class DiscoveryService:
         # Cqe for cmd property set
         # property set only support controller configruration request
         property_set = CqePropertyGetSet()
-        if nvmeof_prop_get_set_offset == NVME_CTL_CONFIGURATION:
-            property_set.sq_head_ptr = struct.pack('<H', sq_head_ptr)
-            property_set.cmd_id = struct.pack('<H', cmd_id)
-        else:
-            self.logger.error("only support controller configruration in property set")
+        property_set.sq_head_ptr = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].sq_head_ptr)
+        property_set.cmd_id = struct.pack('<H', cmd_id)
 
         reply = pdu_reply.compose_reply() + property_set.compose_reply()
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
-            self.logger.debug("client disconnected unexpectedly.")
-            return -1, 0
+            self.logger.error("client disconnected unexpectedly.")
+            return -1
         self.logger.debug("reply property set request.")
-        return 0, shutdown_notification
+        return 0
 
-    def reply_identify(self, sock, data, cmd_id,
-                       self_cnlid, nvmeof_connect_data_subnqn):
+    def reply_identify(self, conn, data, cmd_id):
         """Reply identify request."""
 
         self.logger.debug("handle identify request.")
@@ -587,11 +634,12 @@ class DiscoveryService:
 
         # NVM Express
         identify_reply = NVMeIdentify()
-        # Q: version: 0.01
-        identify_reply.firmware_revision = b'\x30\x30\x2e\x30\x31\x20\x20\x20'
+        # Q: version: 23.01?
+        identify_reply.firmware_revision = b'\x32\x33\x2e\x30\x31\x20\x20\x20'
         # maximum data transfer size: 2^5=32 pages
         identify_reply.mdts = b'\x05'
-        identify_reply.controller_id = struct.pack('<H', self_cnlid)
+        identify_reply.controller_id = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].cnlid)
         # version: 1.3
         identify_reply.version = b'\x00\x03\x01\x00'
         identify_reply.oaes = b'\x00\x00\x00\x80'
@@ -607,19 +655,20 @@ class DiscoveryService:
         identify_reply.acwu = b'\x01\x00'
         identify_reply.sgls = b'\x05\x00\x10\x00'
         for i in range(256):
-            identify_reply.subnqn[i] = nvmeof_connect_data_subnqn[i]
+            identify_reply.subnqn[i] = \
+                self.conn_vals[conn.fileno()].nvmeof_connect_data_subnqn[i]
 
         reply = pdu_reply.compose_reply() + nvme_tcp_data_pdu.compose_reply() + \
                 identify_reply.compose_reply()
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
-            self.logger.debug("client disconnected unexpectedly.")
+            self.logger.error("client disconnected unexpectedly.")
             return -1
         self.logger.debug("reply identify request.")
         return 0
 
-    def reply_set_feature(self, sock, data, sq_head_ptr, cmd_id):
+    def reply_set_feature(self, conn, data, cmd_id):
         """Reply set feature request."""
 
         self.logger.debug("handle set feature request.")
@@ -642,21 +691,21 @@ class DiscoveryService:
         pdu_reply.packet_length = b'\x18\x00\x00\x00'
 
         # Cqe for cmd property set feature
-        set_feature_reply = CqeSetFeature()
-        set_feature_reply.sq_head_ptr = struct.pack('<H', sq_head_ptr)
+        set_feature_reply = CqeNVMe()
+        set_feature_reply.sq_head_ptr = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].sq_head_ptr)
         set_feature_reply.cmd_id = struct.pack('<H', cmd_id)
 
         reply = pdu_reply.compose_reply() + set_feature_reply.compose_reply()
         try:
-            sock.sendall(reply)
+            conn.sendall(reply)
         except BrokenPipeError:
-            self.logger.debug("client disconnected unexpectedly.")
+            self.logger.error("client disconnected unexpectedly.")
             return -1
         self.logger.debug("reply set feature request.")
         return 0
 
-    def reply_get_log_page(self, sock, data, cmd_id,
-                           self_gen_cnt, log_page, log_page_len):
+    def reply_get_log_page(self, conn, data, cmd_id):
         """Reply get log page request."""
 
         self.logger.debug("handle get log page request.")
@@ -686,18 +735,21 @@ class DiscoveryService:
 
         if get_logpage_lid != 0x70:
             self.logger.error(f"request type error, not discovery request.")
-            return -1, 0, 0
+            return -1
 
         # Prepare all log page data segments
         # TODO: Filter log entries based on access permissions
-        if log_page_len == 0 and nvme_data_len > 16:
-            log_page_len = 1024 * (len(listeners) + 1)
-            log_page = bytearray(log_page_len)
+        if self.conn_vals[conn.fileno()].log_page_len == 0 and nvme_data_len > 16:
+            self.conn_vals[conn.fileno()].log_page_len = 1024 * (len(listeners) + 1)
+            self.conn_vals[conn.fileno()].log_page = \
+                bytearray(self.conn_vals[conn.fileno()].log_page_len)
 
             nvme_get_log_page_reply = NVMeGetLogPage()
-            nvme_get_log_page_reply.genctr = struct.pack('<Q', self_gen_cnt)
+            nvme_get_log_page_reply.genctr = \
+                struct.pack('<Q', self.conn_vals[conn.fileno()].gen_cnt)
             nvme_get_log_page_reply.numrec = struct.pack('<Q', len(listeners))
-            log_page[0:1024] = nvme_get_log_page_reply.compose_data_reply()
+            self.conn_vals[conn.fileno()].log_page[0:1024] = \
+                nvme_get_log_page_reply.compose_data_reply()
 
             # log entries
             log_entry_counter = 0
@@ -733,13 +785,16 @@ class DiscoveryService:
                 # Transport address
                 log_entry.traddr = str(listeners[log_entry_counter]["traddr"]).encode().ljust(256, b'\x20')
 
-                log_page[1024*(log_entry_counter+1):1024*(log_entry_counter+2)] = log_entry.compose_reply()
+                self.conn_vals[conn.fileno()].log_page[1024*(log_entry_counter+1): \
+                    1024*(log_entry_counter+2)] = log_entry.compose_reply()
                 log_entry_counter += 1
         else:
-            self.logger.debug(f"in the process of sending log pages...")
+            self.logger.debug("in the process of sending log pages...")
 
         # reply based on the received get log page request packet(length)
+        reply = b''
         if nvme_data_len == 16:
+            # nvme 1.x
             pdu_reply = Pdu()
             pdu_reply.type = bytearray([NVME_TCP_C2H_DATA])
             pdu_reply.specical_flag = b'\x0c'
@@ -754,17 +809,35 @@ class DiscoveryService:
 
             # NVM Express
             nvme_get_log_page_reply = NVMeGetLogPage()
-            nvme_get_log_page_reply.genctr = struct.pack('<Q', self_gen_cnt)
+            nvme_get_log_page_reply.genctr = \
+                struct.pack('<Q', self.conn_vals[conn.fileno()].gen_cnt)
             nvme_get_log_page_reply.numrec = struct.pack('<Q', len(listeners))
 
             reply = pdu_reply.compose_reply() + nvme_tcp_data_pdu.compose_reply() + \
                     nvme_get_log_page_reply.compose_short_reply()
-            try:
-                sock.sendall(reply)
-            except BrokenPipeError:
-                self.logger.debug("client disconnected unexpectedly.")
-                return -1, 0, 0
-        elif nvme_data_len > 16 and nvme_data_len % 1024 == 0:
+        elif nvme_data_len == 1024:
+            # nvme 2.x
+            pdu_reply = Pdu()
+            pdu_reply.type = bytearray([NVME_TCP_C2H_DATA])
+            pdu_reply.specical_flag = b'\x0c'
+            pdu_reply.header_length = b'\x18'
+            pdu_reply.data_offset = b'\x18'
+            pdu_reply.packet_length = b'\x18\x04\x00\x00'
+
+            nvme_tcp_data_pdu = NVMeTcpDataPdu()
+            nvme_tcp_data_pdu.cmd_id = struct.pack('<H', cmd_id)
+            # TODO: b'\x00\x04\x00\x00'这种都用pack
+            nvme_tcp_data_pdu.data_length = b'\x00\x04\x00\x00'
+
+            nvme_get_log_page_reply = NVMeGetLogPage()
+            nvme_get_log_page_reply.genctr = \
+                struct.pack('<Q', self.conn_vals[conn.fileno()].gen_cnt)
+            nvme_get_log_page_reply.numrec = struct.pack('<Q', len(listeners))
+
+            reply = pdu_reply.compose_reply() + nvme_tcp_data_pdu.compose_reply() + \
+                    nvme_get_log_page_reply.compose_data_reply()
+
+        elif nvme_data_len > 1024 and nvme_data_len % 1024 == 0:
             # class Pdu and NVMeTcpDataPdu
             pdu_and_nvme_pdu_len = 8 + 16
 
@@ -782,77 +855,146 @@ class DiscoveryService:
 
             # NVM Express
             reply = pdu_reply.compose_reply() + nvme_tcp_data_pdu.compose_reply() + \
-                    log_page[0:nvme_data_len]
-            log_page = log_page[nvme_data_len:]
-            log_page_len -= nvme_data_len
-            try:
-                sock.sendall(reply)
-            except BrokenPipeError:
-                self.logger.debug("client disconnected unexpectedly.")
-                return -1, 0, 0
+                    self.conn_vals[conn.fileno()].log_page[0:nvme_data_len]
+            self.conn_vals[conn.fileno()].log_page = \
+                self.conn_vals[conn.fileno()].log_page[nvme_data_len:]
+            self.conn_vals[conn.fileno()].log_page_len -= nvme_data_len
         else:
-            self.logger.error(f"lenghth error. It need be 16 or n*1024")
-            return -1, 0, 0
+            self.logger.error("lenghth error. It need be 16 or n*1024")
+            return -1
+        try:
+            conn.sendall(reply)
+        except BrokenPipeError:
+            self.logger.error("client disconnected unexpectedly.")
+            return -1
         self.logger.debug("reply get log page request.")
-        return 0, log_page, log_page_len
+        return 0
 
+    def reply_keep_alive(self, conn, data, cmd_id):
+        """Reply keep alive request."""
 
-    def nvmeof_tcp_connection(self, sock, addr):
-        self.logger.info(f"Accept new connection from {addr}")
-        # Some common variables
-        nvmeof_connect_data_hostid = ()
-        nvmeof_connect_data_cntlid = 0
-        nvmeof_connect_data_subnqn = ()
-        nvmeof_connect_data_hostnqn = ()
+        self.logger.debug("handle keep alive request.")
+        nvme_sgl = struct.unpack_from('<16B', data, 32)
+        nvme_sgl_desc_type = nvme_sgl[15] & 0xF0
+        nvme_sgl_desc_sub_type = nvme_sgl[15] & 0x0F
+        nvme_keep_alive_dword10 = struct.unpack_from('<I', data, 48)[0]
+        nvme_keep_alive_dword11 = struct.unpack_from('<I', data, 52)[0]
+        nvme_keep_alive_dword12 = struct.unpack_from('<I', data, 56)[0]
+        nvme_keep_alive_dword13 = struct.unpack_from('<I', data, 60)[0]
+        nvme_keep_alive_dword14 = struct.unpack_from('<I', data, 64)[0]
+        nvme_keep_alive_dword15 = struct.unpack_from('<I', data, 68)[0]
+
+        pdu_reply = Pdu()
+        pdu_reply.type = bytearray([NVME_TCP_RSP])
+        pdu_reply.header_length = b'\x18'
+        pdu_reply.packet_length = b'\x18\x00\x00\x00'
+
+         # Cqe for keep alive
+        keep_alive_reply = CqeNVMe()
+        keep_alive_reply.sq_head_ptr = \
+            struct.pack('<H', self.conn_vals[conn.fileno()].sq_head_ptr)
+        keep_alive_reply.cmd_id = struct.pack('<H', cmd_id)
+
+        reply = pdu_reply.compose_reply() + keep_alive_reply.compose_reply()
+        try:
+            conn.sendall(reply)
+        except BrokenPipeError:
+            self.logger.error("client disconnected unexpectedly.")
+            return -1
+        self.logger.debug("reply keep alive request.")
+        return 0
+
+    def store_async(self, conn, data, cmd_id):
+        """Parse and store async event."""
+
+        self.logger.debug("parse and store async event.")
+        nvme_sgl = struct.unpack_from('<16B', data, 32)
+        nvme_sgl_desc_type = nvme_sgl[15] & 0xF0
+        nvme_sgl_desc_sub_type = nvme_sgl[15] & 0x0F
+        nvme_async_dword10 = struct.unpack_from('<I', data, 48)[0]
+        nvme_async_dword11 = struct.unpack_from('<I', data, 52)[0]
+        nvme_async_dword12 = struct.unpack_from('<I', data, 56)[0]
+        nvme_async_dword13 = struct.unpack_from('<I', data, 60)[0]
+        nvme_async_dword14 = struct.unpack_from('<I', data, 64)[0]
+        nvme_async_dword15 = struct.unpack_from('<I', data, 68)[0]
+
+        self.conn_vals[conn.fileno()].recv_async = True
+        self.conn_vals[conn.fileno()].async_cmd_id = cmd_id
+
+    def _state_notify_update(self, update, is_add_req):
+        """Notify and reply async event."""
+
+        for key in list(self.conn_vals.keys()):
+            if self.conn_vals[key].recv_async is True:
+                async_reply = CqeNVMe()
+                # async_event_type:0x2 async_event_info:0xf0 log_page_identifier:0x70
+                async_reply.dword0 = b'\x02\xf0\x70\x00'
+                async_reply.sq_head_ptr = \
+                    struct.pack('<H', self.conn_vals[key].sq_head_ptr)
+                async_reply.cmd_id = struct.pack('<H', self.conn_vals[key].async_cmd_id)
+                reply = async_reply.compose_reply()
+                try:
+                    self.conn_vals[key].connection.sendall(reply)
+                except BrokenPipeError:
+                    self.logger.error("client disconnected unexpectedly.")
+                    return -1
+                self.logger.debug("notify and reply async request.")
+                self.conn_vals[key].recv_async = False
+                return 0
+
+    def handle_timeout(self):
+        """Handle connection timeout."""
+
+        # The timeout time determination here is not very accurate.
+        # and instead of locking, a snapshot(every 0.1s) is used.
+        while True:
+            for key in list(self.conn_vals.keys()):
+                if self.conn_vals[key].keep_alive_timeout != 0 and \
+                  time.time() - self.conn_vals[key].keep_alive_time >= \
+                    self.conn_vals[key].keep_alive_timeout:
+                    self.logger.debug(f"discover request from {self.conn_vals[key].connection} timeout.")
+                    self.selector.unregister(self.conn_vals[key].connection)
+                    self.conn_vals[key].connection.close()
+                    del self.conn_vals[key]
+            time.sleep(0.1)
+
+    def nvmeof_tcp_connection(self, conn, mask):
+        """Handle request."""
+
         err = 0
-        sq_head_ptr = 0
-        log_page = bytearray()
-        log_page_len = 0
-        shutdown_notification = 0
-        shutdown_now = 0
-        global GLOBAL_CNLID
-        global GLOBAL_GEN_CNT
-        lock.acquire()
-        self_cnlid = GLOBAL_CNLID
-        self_gen_cnt = GLOBAL_GEN_CNT
-        GLOBAL_CNLID += 1
-        GLOBAL_GEN_CNT += 1
-        lock.release()
+        try:
+            message = conn.recv(NVME_TCP_PDU_UNIT)
+            if message:
+                self.conn_vals[conn.fileno()].recv_buffer += message
+            else:
+                return
+        except BlockingIOError:
+            self.logger.error(f"recived data failed.")
 
         while True:
-            sq_head_ptr += 1
-            if sq_head_ptr > SQ_HEAD_MAX:
-                sq_head_ptr = 1
-            head = sock.recv(NVME_TCP_PDU_UNIT)
-            if not head:
-                time.sleep(0.01)
-                continue
+            if len(self.conn_vals[conn.fileno()].recv_buffer) < 8:
+                return
+            pdu = struct.unpack_from('<BBBBI', \
+                self.conn_vals[conn.fileno()].recv_buffer, 0)
+            pdu_type = pdu[0]
+            psh_flag = pdu[1]
+            ph_len = pdu[2]
+            ph_off = pdu[3]
+            package_len = pdu[4]
+            if len(self.conn_vals[conn.fileno()].recv_buffer) < package_len:
+                return
 
-            PDU = struct.unpack_from('<BBBBI', head, 0)
-            pdu_type = PDU[0]
-            PSH_flag = PDU[1]
-            PH_len = PDU[2]
-            PH_off = PDU[3]
-            package_len = PDU[4]
+            data = self.conn_vals[conn.fileno()].recv_buffer[:package_len]
+            self.conn_vals[conn.fileno()].recv_buffer = \
+                self.conn_vals[conn.fileno()].recv_buffer[package_len:]
 
-            # if the length exceeds one packet, continue to recive
-            buffer = [head]
-            if package_len > NVME_TCP_PDU_UNIT:
-                i = package_len // NVME_TCP_PDU_UNIT
-                if package_len % NVME_TCP_PDU_UNIT == 0:
-                    i -= 1
-                while i > 0:
-                    d = sock.recv(NVME_TCP_PDU_UNIT)
-                    if d:
-                        buffer.append(d)
-                        i -= 1
-                    else:
-                        break
-            data = b''.join(buffer)
+            self.conn_vals[conn.fileno()].sq_head_ptr += 1
+            if self.conn_vals[conn.fileno()].sq_head_ptr > SQ_HEAD_MAX:
+                self.conn_vals[conn.fileno()].sq_head_ptr = 1
 
             # ICreq
             if pdu_type == NVME_TCP_ICREQ:
-                err = self.reply_initialize(sock)
+                err = self.reply_initialize(conn)
 
             # CMD
             if pdu_type == NVME_TCP_CMD:
@@ -866,17 +1008,13 @@ class DiscoveryService:
                     fabric_cmd_type = struct.unpack_from('<B', data, 12)[0]
 
                     if fabric_cmd_type == NVME_FCTYPE_CONNECT:
-                        (err, nvmeof_connect_data_hostid, nvmeof_connect_data_cntlid,
-                            nvmeof_connect_data_subnqn, nvmeof_connect_data_hostnqn) = \
-                            self.reply_fc_cmd_connect(sock, data, self_cnlid, sq_head_ptr)
+                        err = self.reply_fc_cmd_connect(conn, data)
 
                     if fabric_cmd_type == NVME_FCTYPE_PROP_GET:
-                        err, shutdown_now = self.reply_fc_cmd_prop_get(sock, data, sq_head_ptr,
-                                                                       cmd_id, shutdown_notification)
+                        err = self.reply_fc_cmd_prop_get(conn, data, cmd_id)
 
                     if fabric_cmd_type == NVME_FCTYPE_PROP_SET:
-                        err, shutdown_notification = self.reply_fc_cmd_prop_set(sock, data,
-                                                                                sq_head_ptr, cmd_id)
+                        err = self.reply_fc_cmd_prop_set(conn, data, cmd_id)
 
                     if fabric_cmd_type == NVME_FCTYPE_AUTH_SEND:
                         self.logger.error("can't handle NVME_FCTYPE_AUTH_SEND request.")
@@ -886,49 +1024,80 @@ class DiscoveryService:
                         self.logger.error("can't handle NVME_FCTYPE_DISCONNECT request.")
 
                 if opcode == NVME_AQ_OPC_GET_LOG_PAGE:
-                    err, log_page, log_page_len = self.reply_get_log_page(sock, data, cmd_id, self_gen_cnt,
-                                                                          log_page, log_page_len)
+                    err = self.reply_get_log_page(conn, data, cmd_id)
 
                 if opcode == NVME_AQ_OPC_IDENTIFY:
-                    err, self.reply_identify(sock, data, cmd_id, self_cnlid,
-                                             nvmeof_connect_data_subnqn)
+                    err = self.reply_identify(conn, data, cmd_id)
 
                 if opcode == NVME_AQ_OPC_SET_FEATURES:
-                    err = self.reply_set_feature(sock, data, sq_head_ptr, cmd_id)
-
-                if opcode == NVME_AQ_OPC_ASYNC_EVE_REQ:
-                    # TODO
-                    self.logger.error("can't handle asycn event now. ")
+                    err = self.reply_set_feature(conn, data, cmd_id)
 
                 if opcode == NVME_AQ_OPC_KEEP_ALIVE:
-                    # TODO
-                    self.logger.error("can't handle keep alive now.")
+                    err = self.reply_keep_alive(conn, data, cmd_id)
+                    self.conn_vals[conn.fileno()].keep_alive_time = time.time()
 
-            if shutdown_now == 1:
-                break
+                if opcode == NVME_AQ_OPC_ASYNC_EVE_REQ:
+                    err = self.store_async(conn, data, cmd_id)
+
             if err == -1:
                 self.logger.error("error, close connection.")
-                break
-        sock.close()
-        self.logger.info(f"connection from {addr} closed.")
+                return
+            if err == -1 or self.conn_vals[conn.fileno()].shutdown_now == 1:
+                del self.conn_vals[conn.fileno()]
+                self.selector.unregister(conn)
+                self.logger.debug(f"discover request from {conn} finished.")
+                conn.close()
+                return
+
+    def nvmeof_accept(self, sock, mask):
+        """Accept connection."""
+
+        conn, addr = sock.accept()
+        self.logger.debug(f"accept connection {conn} from {addr}")
+        conn.setblocking(False)
+        if conn.fileno() not in self.conn_vals:
+            self.conn_vals[conn.fileno()] = Connection()
+            self.conn_vals[conn.fileno()].connection = conn
+            global GLOBAL_CNLID
+            global GLOBAL_GEN_CNT
+            lock.acquire()
+            self.conn_vals[conn.fileno()].cnlid = GLOBAL_CNLID
+            self.conn_vals[conn.fileno()].gen_cnt = GLOBAL_GEN_CNT
+            GLOBAL_CNLID += 1
+            GLOBAL_GEN_CNT += 1
+            lock.release()
+        self.selector.register(conn, selectors.EVENT_READ, \
+                               self.nvmeof_tcp_connection)
 
     def start_service(self):
         """Enable listening on the server side."""
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((self.discovery_addr, int(self.discovery_port)))
-        # maximum number of connections
-        s.listen(5)
-        self.logger.info("waiting for connection...")
-        # TODO: change to multi connection module
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((self.discovery_addr, int(self.discovery_port)))
+        sock.listen(MAX_CONNECTION)
+        sock.setblocking(False)
+        self.selector.register(sock, selectors.EVENT_READ, self.nvmeof_accept)
+        self.logger.debug("waiting for connection...")
+        t = threading.Thread(target=self.handle_timeout)
+        t.start()
+
+        omap_state = OmapGatewayState(self.config)
+        local_state = LocalGatewayState()
+        gateway_state = GatewayStateHandler(self.config, local_state,
+                                            omap_state, self._state_notify_update)
+        gateway_state.start_update()
+
         try:
           while True:
-            sock, addr = s.accept()
-            # create thread to handle nvme/tcp connection
-            t = threading.Thread(target=self.nvmeof_tcp_connection, args=(sock, addr))
-            t.start()
+            events = self.selector.select()
+            for key, mask in events:
+                callback = key.data
+                callback(key.fileobj, mask)
         except KeyboardInterrupt:
-          self.logger.info("received a ctrl+C interrupt. exiting...")
+          for key in self.conn_vals:
+            self.conn_vals[key].connection.close()
+          self.selector.close()
+          self.logger.debug("received a ctrl+C interrupt. exiting...")
 
 def main(args=None):
     # Set up root logger
