@@ -288,6 +288,80 @@ sh -c 'echo 4096 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
 
 This is automatically done in the `make setup` step. The amount of hugepages can be configured with `make setup HUGEPAGES=512`.
 
+### Enable DSA to offload and accelerate CRC calculation
+
+Intel® Data Streaming Accelerator (Intel® DSA) can generate and test CRC checksum or Data Integrity Field (DIF) on the memory region to support usages typical with storage and networking applications. This feature has already been implemented in SPDK. Enabling this feature allows for offloading and accelerating CRC calculations in NVMe-oF.
+
+#### DSA Configuration
+
+```bash
+[spdk]
+enable_dsa = True
+```
+
+#### Enable DSA in containers using privileged mode
+
+A container running in `privileged` mode can access all devices of the host machine and can perform almost all operation. But it also brings security risks. Add the privileged mode flag under the `nvmeof-base` container in the docker-compose.yaml file：
+
+```bash
+  nvmeof-base:
+    privileged: True
+```
+#### Enable DSA in containers using vfio mode
+
+To avoid the risks brought by `privilege` mode. It is recommended to use `vfio` mode to use DSA in the container. Refer: [SPDK System Configuration User Guide: Device access](https://spdk.io/doc/system_configuration.html#system_configuration_nonroot_device_access).
+
+1. Load `vfio` and `vfio-pci` driver. Enable `IOMMU`.
+
+2. Use DPDK to bind DSA as `vfio-pci`. In `ceph-nvmeof` directory, exec:
+
+```bash
+./spdk/dpdk/usertools/dpdk-devbind.py -s
+```
+
+The output may include:
+
+```bash
+DMA devices using DPDK-compatible driver
+========================================
+0000:6a:01.0 'Device 0b25' drv=vfio-pci unused=idxd
+0000:e7:01.0 'Device 0b25' drv=vfio-pci unused=idxd
+```
+
+If the drive it displays is not `vfio-pci`, bind it to this. Execute:
+
+```bash
+./spdk/dpdk/usertools/dpdk-devbind.py -u 0000:6a:01.0 0000:e7:01.0
+./spdk/dpdk/usertools/dpdk-devbind.py -b vfio-pci 0000:6a:01.0 0000:e7:01.0
+```
+
+3. Check the IOMMU group of DSA devices:
+
+```bash
+readlink "/sys/bus/pci/devices/0000:6a:01.0/iommu_group"
+```
+
+The output should be e.g. `../../../kernel/iommu_groups/49`
+
+4. update docker-compose.yaml:
+
+```bash
+  nvmeof-base:
+    devices:
+      - /dev/vfio/vfio:/dev/vfio/vfio
+      - /dev/vfio/49:/dev/vfio/49
+      - /dev/vfio/250:/dev/vfio/250
+    volumes:
+    cap_add:
+      - IPC_LOCK # DMA pinning
+```
+
+Then run `make up` to start container. If DSA is successfully enabled, the following logs can be seen:
+
+```bash
+accel_dsa_rpc.c:  50:rpc_dsa_scan_accel_module: *NOTICE*: Enabled DSA user-mode
+```
+
 ## Development
 
 ### Set-up
