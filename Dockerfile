@@ -21,8 +21,8 @@ RUN \
     dnf install -y python3-rbd && \
     dnf config-manager --set-enabled crb && \
     dnf install -y ceph-mon-client-nvmeof
-ENTRYPOINT ["python3", "-m", "control"]
-CMD ["-c", "/src/ceph-nvmeof.conf"]
+#ENTRYPOINT ["python3", "-m", "control"]
+#CMD ["-c", "/src/ceph-nvmeof.conf"]
 
 #------------------------------------------------------------------------------
 # Intermediate layer for Python set-up
