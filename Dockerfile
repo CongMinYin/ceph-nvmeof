@@ -20,7 +20,8 @@ RUN \
     dnf install -y python3-rados && \
     dnf install -y python3-rbd && \
     dnf config-manager --set-enabled crb && \
-    dnf install -y ceph-mon-client-nvmeof
+    dnf install -y ceph-mon-client-nvmeof && \
+    dnf install -y perf
 #ENTRYPOINT ["python3", "-m", "control"]
 #CMD ["-c", "/src/ceph-nvmeof.conf"]
 

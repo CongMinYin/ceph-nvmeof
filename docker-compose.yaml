@@ -74,8 +74,6 @@ services:
       start_period: 6s
       interval: 3s
       retries: 10
-    volumes:
-      - ceph-conf:/etc/ceph
     ulimits:
       nofile: 1024
     networks:
@@ -135,7 +133,7 @@ services:
       - $NVMEOF_CONFIG:/src/ceph-nvmeof.conf
       - /tmp/coredump:/tmp/coredump # core dump
       - /var/log/ceph:/var/log/ceph
-      - ceph-conf:/etc/container-ceph
+      #- ceph-conf:/etc/ceph
       - /etc/ceph:/etc/ceph
     cap_add:
       - SYS_ADMIN # huge-pages
@@ -246,8 +244,6 @@ services:
         HUGEPAGES_DIR:
       labels:
         io.ceph.nvmeof:
-volumes:
-  ceph-conf:
 networks:
   default:
     enable_ipv6: true
